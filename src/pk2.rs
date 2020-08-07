@@ -1,6 +1,13 @@
+#![allow(unused)]
+#![allow(dead_code)]
+
 use std::convert::TryInto;
 use std::iter::Iterator;
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Read};
+use std::io::{self, 
+    Read, BufRead, BufReader, 
+    Write, BufWriter, 
+    Seek, SeekFrom, 
+};
 
 use crate::blowfish::BlowFish;
 
@@ -10,16 +17,16 @@ const PK2_KEYS: &[u8] = &[0x32, 0xCE, 0xDD, 0x7C, 0xBC, 0xA8];
 const DIRECTORY: u8 = 1;
 const FILE: u8 = 2;
 
-fn four_byte_to_u32(buffer: &[u8; 4]) -> u32 {
-    ((((buffer[0] as u32) << 24) | ((buffer[1] as u32) << 16)) | ((buffer[2] as u32) << 8)) | (buffer[3] as u32)
+fn four_byte_to_u32(buffer: &[u8]) -> u32 {
+    ((((buffer[3] as u32) << 24) | ((buffer[2] as u32) << 16)) | ((buffer[1] as u32) << 8)) | (buffer[0] as u32)
 }
 
 fn u32_to_slice(number: u32) -> [u8; 4] {
     [
-        ((number >> 0x18) as u8), 
-        ((number >> 0x10) as u8),
+        ((number >> 0x00) as u8), 
         ((number >> 0x08) as u8),
-        ((number >> 0x00) as u8),
+        ((number >> 0x10) as u8),
+        ((number >> 0x18) as u8),
     ]
 }
 
@@ -72,10 +79,10 @@ impl Entry {
             entry_type,
             name,
             date_data,
-            pos_low: four_byte_to_u32(buffer[index..(index+4)].try_into().unwrap()),
-            pos_high: four_byte_to_u32(buffer[(index+4)..(index+8)].try_into().unwrap()),
-            size: four_byte_to_u32(buffer[(index+8)..(index+12)].try_into().unwrap()),
-            next_chain: four_byte_to_u32(buffer[(index+12)..(index+16)].try_into().unwrap()),
+            pos_low: four_byte_to_u32(&buffer[index..(index+4)]),
+            pos_high: four_byte_to_u32(&buffer[(index+4)..(index+8)]),
+            size: four_byte_to_u32(&buffer[(index+8)..(index+12)]),
+            next_chain: four_byte_to_u32(&buffer[(index+12)..(index+16)]),
             garbage: buffer[(index+16)..(index+22)].try_into().unwrap()
         }
     }
@@ -109,6 +116,18 @@ impl Entry {
 
         buffer
     }
+
+    fn name(&self) -> String {
+        let mut name: Vec<u8> = self.name.iter().filter(|chr| chr > &&0).map(|x| *x).collect();
+        let len = name.len();
+        name.clone_from_slice(&self.name[0..len]);
+        String::from_utf8(name).unwrap_or(String::from("Couldn't"))
+    }
+
+    fn to_string(&self) -> String {
+        format!("Entry<type: {}, name: {}, pos_low: {}, size: {}, next_chain: {}>",
+                    self.entry_type, self.name(), self.pos_low, self.size, self.next_chain)
+    }
 }
 
 struct Extractor {
@@ -126,18 +145,44 @@ impl Extractor {
         };
 
         extractor.root = extractor.get_entry_at_offset(SKIP_HEADER_SIZE as u32); 
-
-        let mut t = vec![0; 81];
-        t.clone_from_slice(&extractor.root.unwrap().name[..]);
-        println!("{:?}", String::from_utf8(t));
         extractor
     }
 
-    fn extract(&self, path: &str) -> Vec<u8> {
-        
-        let entry = self.get_entry_of_path(path);
+    fn list(&self, directory: &str) -> Vec<Entry>
+    {
+        let path_node = if directory.eq_ignore_ascii_case(".") { 
+            self.root 
+        } else { 
+            self.get_entry_of_path(directory)
+        };
 
-        Vec::new()
+        self.get_children_of_node(&path_node.unwrap())
+    }
+
+    fn extract(&self, path: &str) -> (Entry, Vec<u8>) {
+        let entry = self.get_entry_of_path(path);
+        let entry = entry.unwrap();
+        let bytes = self.read_bytes(entry.pos_low, entry.size).unwrap();
+        (entry, bytes)
+    }
+
+    fn edit(&self, path: &str, buffer: &[u8]) -> Result<(), &str> {
+        // Get the entry, if doesn't exist will panic!
+        let mut entry = self.get_entry_of_path(path).unwrap();
+
+        // we have the entry now so we will write the buffer
+        // first to get the offset where it got written
+        // we appended buffer at the end of the file
+        // and ignored the actual old file, it still exists but we cant get it
+        let offset = self.append_bytes(buffer).unwrap();
+
+        // now we will update our existing entry 
+        // with the new size and pos_low(which is it's new location)
+        entry.pos_low = offset as u32;
+        entry.size = buffer.len() as u32;
+        let encrypted = self.blowfish.encrypt(&entry.into_bytes(), 128);
+        self.write_bytes(entry.offset, &encrypted);
+        Ok(())
     }
 
     fn get_entry_of_path(&self, path: &str) -> Option<Entry> {
@@ -158,33 +203,38 @@ impl Extractor {
         }
 
         let children = self.get_children_of_node(&cursor);
-        for child in children.iter() {
-            println!("{:?}", &child.name[..]);
-            // if(String.Equals(
-            //     path, child.nodeEntry.name, StringComparison.InvariantCultureIgnoreCase)) {
-            //     return child;
-            // }
+        for child in children.into_iter() {
+            if child.name()[..].eq_ignore_ascii_case(path) {
+                return Some(child);
+            }
         }
-        panic!("Can't find specified path.");
+        panic!(format!("Can't find specified path: {}.", path));
     }
 
     fn get_children_of_node(&self, entry: &Entry) -> Vec<Entry> {
+        if entry.entry_type != DIRECTORY {
+            return vec![];
+        }
         let mut children: Vec<Entry> = Vec::new();
-        let mut current_index = entry.pos_low; // + ENTRY_SIZE as u32;
+        let mut current_index = entry.pos_low + 128;
+
         loop {
             let walking_node = self.get_entry_at_offset(current_index).unwrap();
-            let next_chain = walking_node.next_chain;
-            let pos_low = walking_node.pos_low;
+
+            if walking_node.entry_type > 2 || walking_node.entry_type <= 0 {
+                break;
+            }
+
             children.push(walking_node);
 
-            if next_chain > 0 {
-                current_index = next_chain;
+            if walking_node.next_chain > 0 && walking_node.next_chain != current_index {
+                current_index = walking_node.next_chain;
             } else {
                 current_index += ENTRY_SIZE as u32;
             }
 
             // If at the end of the chain
-            if current_index == pos_low {
+            if walking_node.offset + 128 == walking_node.pos_low {
                 break;
             }
         }
@@ -208,6 +258,20 @@ impl Extractor {
         Ok(buffer)
     }
 
+    fn append_bytes(&self, buffer: &[u8]) -> io::Result<(u64)> {
+        let mut writer = BufWriter::new(std::fs::File::open(&self.pk2_path)?);
+        let index = writer.seek(SeekFrom::End(0)).unwrap();
+        writer.write_all(buffer);
+        Ok(index)
+    }
+
+    fn write_bytes(&self, offset: u32, buffer: &[u8]) -> io::Result<()> {
+        let mut writer = BufWriter::new(std::fs::File::open(&self.pk2_path)?);
+        writer.seek(SeekFrom::Start(offset.into()));
+        writer.write_all(buffer);
+        Ok(())
+    }
+
     fn split_path<'a>(&self, path: &'a str) -> Vec<&'a str> {
         path.split('/').collect::<Vec<&str>>()
                         .into_iter()
@@ -224,30 +288,30 @@ mod tests {
     
     #[test]
     fn test_entry_conversion() {
-
         let buffer: Vec<u8> = (0..128).map(|i| i as u8 ).collect();
-
         let entry = Entry::from_bytes(buffer.as_slice().try_into().unwrap());
-
         let back = entry.into_bytes();
 
         assert_eq!(back.len(), 128);
         for (i, j) in back.iter().zip(buffer.iter()) {
             assert_eq!(i, j);
         }
-
     }
 
     #[test]
     fn test_extract() {
-
-        let path = "/home/sorcerer/Desktop/Music.pk2";
-
+        let path = "/home/sorcerer/Desktop/Media.pk2";
         let extractor = Extractor::new(path);
-
-        // extractor.extract("server_dep/silkroad/textdata/siegefortressreward.txt");
-
+        let output = extractor.extract("server_dep/silkroad/textdata/siegefortressreward.txt");
     }
+
+    #[test]
+    fn test_list() {
+        let path = "/home/sorcerer/Desktop/Media.pk2";
+        let extractor = Extractor::new(path);
+        let children = extractor.list("server_dep/silkroad/textdata");
+    }
+
 }
 
 
