@@ -1,9 +1,8 @@
-.PHONY: clean test
+.PHONY: clean build
 
 clean:
 	find . -name '*.py[co]' -delete
 
-test:
+build:
 	cargo build --release
-	mv target/release/libpk2.so target/release/pk2.so
-	python3 script.py 
+	./build-wheels.sh
