@@ -8,6 +8,7 @@ use pyo3::callback::IntoPyCallbackOutput;
 
 use std::convert::TryInto;
 use std::iter::Iterator;
+use std::fs::OpenOptions;
 use std::io::{self, 
     Read, BufRead, BufReader, 
     Write, BufWriter, 
@@ -183,7 +184,7 @@ impl Extractor {
         Ok((entry, bytes))
     }
 
-    fn edit(&self, path: &str, buffer: &[u8]) -> PyResult<()> {
+    fn patch(&self, path: &str, buffer: &[u8]) -> PyResult<()> {
         // Get the entry, if doesn't exist will panic!
         let mut entry = self.get_entry_of_path(path).unwrap();
 
@@ -198,7 +199,8 @@ impl Extractor {
         entry.pos_low = offset as u32;
         entry.size = buffer.len() as u32;
         let encrypted = self.blowfish.encrypt(&entry.into_bytes(), 128);
-        self.write_bytes(entry.offset, &encrypted);
+        self.write_bytes(entry.offset, &encrypted).expect(
+            "Couldn't write updated entry.");
         Ok(())
     }
 
@@ -273,23 +275,23 @@ impl Extractor {
 
     fn read_bytes(&self, offset: u32, count: u32) -> io::Result<Vec<u8>> {
         let mut buffer = vec![0u8; count as usize];
-        let mut reader = BufReader::new(std::fs::File::open(&self.pk2_path)?);
+        let mut reader = BufReader::new(OpenOptions::new().read(true).open(&self.pk2_path)?);
         reader.seek(SeekFrom::Start(offset.into()));
         reader.read_exact(&mut buffer);
         Ok(buffer)
     }
 
     fn append_bytes(&self, buffer: &[u8]) -> io::Result<(u64)> {
-        let mut writer = BufWriter::new(std::fs::File::open(&self.pk2_path)?);
+        let mut writer = BufWriter::new(OpenOptions::new().append(true).open(&self.pk2_path)?);
         let index = writer.seek(SeekFrom::End(0)).unwrap();
-        writer.write_all(buffer);
+        writer.write_all(buffer).expect("Couldn't append bytes.");
         Ok(index)
     }
 
     fn write_bytes(&self, offset: u32, buffer: &[u8]) -> io::Result<()> {
-        let mut writer = BufWriter::new(std::fs::File::open(&self.pk2_path)?);
+        let mut writer = BufWriter::new(OpenOptions::new().write(true).open(&self.pk2_path)?);
         writer.seek(SeekFrom::Start(offset.into()));
-        writer.write_all(buffer);
+        writer.write_all(buffer).expect("Couldn't write to file.");
         Ok(())
     }
 
@@ -330,8 +332,19 @@ mod tests {
     fn test_list() {
         let path = "/home/sorcerer/Desktop/Media.pk2";
         let extractor = Extractor::new(Some(path));
-        let children = extractor.unwrap().list(
-            Some("server_dep/silkroad/textdata"));
+        let output = extractor.unwrap().extract(
+            Some("server_dep/silkroad/textdata/siegefortressreward.txt"));
+    }
+
+    #[test]
+    #[ignore]
+    fn test_patch() {
+        let path = "/home/sorcerer/Desktop/Media.pk2";
+        let extractor = Extractor::new(Some(path));
+        let index = extractor.unwrap().patch(
+            "server_dep/silkroad/textdata/siegefortressreward.txt", 
+            &[1,2,3,4,5,6,8,9]
+        );
     }
 
 }
