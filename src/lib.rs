@@ -1,33 +1,31 @@
-#![allow(unused)]
-#![allow(dead_code)]
-
 use pyo3::prelude::*;
-use pyo3::wrap_pyfunction;
-use pyo3::exceptions;
-use pyo3::callback::IntoPyCallbackOutput;
 
-use std::convert::TryInto;
+use bytes::{Buf, BufMut};
 use std::iter::Iterator;
 use std::fs::OpenOptions;
 use std::io::{self, 
-    Read, BufRead, BufReader, 
+    Read, BufReader, 
     Write, BufWriter, 
     Seek, SeekFrom, 
 };
 
-mod helpers;
-mod blowfish;
 
-use crate::helpers::*;
+mod blowfish;
 use crate::blowfish::BlowFish;
 
 #[pymodule]
 fn pk2(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_class::<Entry>();
-    m.add_class::<Extractor>();
+    m.add_class::<Entry>().unwrap();
+    m.add_class::<Extractor>().unwrap();
     Ok(())
 }
 
+
+const ENTRY_SIZE: u64 = 128;
+const SKIP_HEADER_SIZE: u64 = 256;
+const PK2_KEYS: &[u8] = &[0x32, 0xCE, 0xDD, 0x7C, 0xBC, 0xA8];
+const DIRECTORY: u8 = 1;
+const FILE: u8 = 2;
 
 /**
  * Entries should be of Size 128 Byte.
@@ -37,22 +35,21 @@ fn pk2(_py: Python, m: &PyModule) -> PyResult<()> {
 struct Entry {
 
     #[pyo3(get)]
-    offset: u32,          // for use in code, not saved in data
+    offset: u64,            // for use in code, not saved in data
 
     #[pyo3(get)]
-    entry_type: u8,         // 01 Byte;
+    entry_type: u8,         // 1 Byte;
 
     name: [u8; 81],         // 81 Byte;
     
-    date_data: [u8; 24],    // 24 Byte; useless but better reserved
+    access_date: u64,        // 8 Byte; Format is 'filetime' and we don't update it anyway.
+    create_date: u64,        // 8 Byte; Format is 'filetime' and we don't update it anyway.
+    modify_date: u64,        // 8 Byte; Format is 'filetime' and we don't update it anyway.
     
     // IF it's a file, this specifies the starting address of the file
     // IF it's a dir, it points to the first entry in that dir
     #[pyo3(get)]
-    pos_low: u32,           // 4 Byte;
-
-    // WILL SEE
-    pos_high: u32,          // 4 Byte;
+    position: u64,          // 8 Byte;
 
     // IF it's a file, then this is its size
     #[pyo3(get)]
@@ -61,84 +58,57 @@ struct Entry {
     // This specifies the offset of the next entry in the same level(directory for example)
     // if '0' means our next entry is directly below us.
     #[pyo3(get)]
-    next_chain: u32,        // 4 Byte;
+    next_chain: u64,        // 8 Byte;
 
     // Just to make it 128 Byte.
-    garbage: [u8; 6]        // 6 Byte;
+    padding: u16            // 2 Byte, unused
 }
 
 #[pymethods]
 impl Entry {
     #[getter]
     fn name(&self) -> String {
-        let mut name: Vec<u8> = self.name.iter().filter(|chr| chr > &&0).map(|x| *x).collect();
-        let len = name.len();
-        name.clone_from_slice(&self.name[0..len]);
+        let name: Vec<u8> = self.name.iter().filter(|chr| chr > &&0).map(|x| *x).collect();
         String::from_utf8(name).unwrap_or(String::from("Couldn't"))
     }
 
-    #[getter]
     fn to_string(&self) -> String {
-        format!("Entry<type: {}, name: {}, pos_low: {}, size: {}, next_chain: {}>",
-                    self.entry_type, self.name(), self.pos_low, self.size, self.next_chain)
+        format!("Entry<type: {}, name: {}, position: {}, size: {}, next_chain: {}>",
+                    self.entry_type, self.name(), self.position, self.size, self.next_chain)
     }
 }
 
 impl Entry {
-    fn from_bytes(buffer: &[u8]) -> Self {
-        
-        let mut index = 0;
-        let entry_type = buffer[index];
-        index += 1;
-
+    fn from_bytes(mut buffer: &[u8]) -> Self {
+        let entry_type = buffer.get_u8();
         let mut name = [0; 81];
-        name.clone_from_slice(&buffer[index..index+81]);
-        index += 81;
-
-        let mut date_data = [0; 24];
-        date_data.clone_from_slice(&buffer[index..index+24]);
-        index += 24;
-
+        buffer.copy_to_slice(&mut name);
         Self {
             offset: 0,
             entry_type,
             name,
-            date_data,
-            pos_low: four_byte_to_u32(&buffer[index..(index+4)]),
-            pos_high: four_byte_to_u32(&buffer[(index+4)..(index+8)]),
-            size: four_byte_to_u32(&buffer[(index+8)..(index+12)]),
-            next_chain: four_byte_to_u32(&buffer[(index+12)..(index+16)]),
-            garbage: buffer[(index+16)..(index+22)].try_into().unwrap()
+            access_date: buffer.get_u64_le(),
+            create_date: buffer.get_u64_le(),
+            modify_date: buffer.get_u64_le(),
+            position: buffer.get_u64_le(),
+            size: buffer.get_u32_le(),
+            next_chain: buffer.get_u64_le(),
+            padding: buffer.get_u16()
         }
     }
 
-    fn into_bytes(&self) -> [u8; 128] {
-        let mut buffer: [u8; 128] = [0; 128];
-        let mut index = 0;
+    fn into_bytes(&self) -> Vec<u8> {
+        let mut buffer: Vec<u8> = Vec::with_capacity(ENTRY_SIZE as usize);
         
-        buffer[index] = self.entry_type;
-        index += 1;
-        
-        buffer[index..(index+81)].clone_from_slice(&self.name);
-        index += 81;
-
-        buffer[index..(index+24)].clone_from_slice(&self.date_data);
-        index += 24;
-        
-        buffer[index..(index+4)].clone_from_slice(&u32_to_slice(self.pos_low));
-        index += 4;
-        
-        buffer[index..(index+4)].clone_from_slice(&u32_to_slice(self.pos_high));
-        index += 4;
-        
-        buffer[index..(index+4)].clone_from_slice(&u32_to_slice(self.size));
-        index += 4;
-
-        buffer[index..(index+4)].clone_from_slice(&u32_to_slice(self.next_chain));
-        index += 4;
-
-        buffer[index..(index+6)].clone_from_slice(&self.garbage);
-
+        buffer.put_u8(self.entry_type);
+        buffer.write(&self.name).unwrap();
+        buffer.put_u64_le(self.access_date);
+        buffer.put_u64_le(self.create_date);
+        buffer.put_u64_le(self.modify_date);
+        buffer.put_u64_le(self.position);
+        buffer.put_u32_le(self.size);
+        buffer.put_u64_le(self.next_chain);
+        buffer.put_u16(self.padding);
         buffer
     }
 }
@@ -160,7 +130,7 @@ impl Extractor {
             root: None
         };
 
-        extractor.root = extractor.get_entry_at_offset(SKIP_HEADER_SIZE as u32); 
+        extractor.root = extractor.get_entry_at_offset(SKIP_HEADER_SIZE); 
         Ok(extractor)
     }
 
@@ -178,9 +148,8 @@ impl Extractor {
 
     fn extract(&self, path: Option<&str>) -> PyResult<(Entry, Vec<u8>)> {
         let path = path.expect("Invalid Path.");
-        let entry = self.get_entry_of_path(path);
-        let entry = entry.unwrap();
-        let bytes = self.read_bytes(entry.pos_low, entry.size).unwrap();
+        let entry = self.get_entry_of_path(path).unwrap();
+        let bytes = self.read_bytes(entry.position, entry.size).unwrap();
         Ok((entry, bytes))
     }
 
@@ -195,8 +164,8 @@ impl Extractor {
         let offset = self.append_bytes(buffer).unwrap();
 
         // now we will update our existing entry 
-        // with the new size and pos_low(which is it's new location)
-        entry.pos_low = offset as u32;
+        // with the new size and position(which is it's new location)
+        entry.position = offset;
         entry.size = buffer.len() as u32;
         let encrypted = self.blowfish.encrypt(&entry.into_bytes(), 128);
         self.write_bytes(entry.offset, &encrypted).expect(
@@ -239,7 +208,7 @@ impl Extractor {
             return vec![];
         }
         let mut children: Vec<Entry> = Vec::new();
-        let mut current_index = entry.pos_low + 128;
+        let mut current_index = entry.position + 128;
 
         loop {
             let walking_node = self.get_entry_at_offset(current_index).unwrap();
@@ -253,11 +222,11 @@ impl Extractor {
             if walking_node.next_chain > 0 && walking_node.next_chain != current_index {
                 current_index = walking_node.next_chain;
             } else {
-                current_index += ENTRY_SIZE as u32;
+                current_index += ENTRY_SIZE;
             }
 
             // If at the end of the chain
-            if walking_node.offset + 128 == walking_node.pos_low {
+            if walking_node.offset + 128 == walking_node.position {
                 break;
             }
         }
@@ -265,33 +234,33 @@ impl Extractor {
         children
     }
 
-    fn get_entry_at_offset(&self, offset: u32) -> Option<Entry> {
-        let bytes = self.read_bytes(offset, ENTRY_SIZE.into());
-        let decrypted = self.blowfish.decrypt(&bytes.unwrap(), ENTRY_SIZE.into());
+    fn get_entry_at_offset(&self, offset: u64) -> Option<Entry> {
+        let bytes = self.read_bytes(offset, ENTRY_SIZE as u32);
+        let decrypted = self.blowfish.decrypt(&bytes.unwrap(), ENTRY_SIZE as u32);
         let mut entry = Entry::from_bytes(&decrypted);
         entry.offset = offset;
         Some(entry)
     }
 
-    fn read_bytes(&self, offset: u32, count: u32) -> io::Result<Vec<u8>> {
+    fn read_bytes(&self, offset: u64, count: u32) -> io::Result<Vec<u8>> {
         let mut buffer = vec![0u8; count as usize];
         let mut reader = BufReader::new(OpenOptions::new().read(true).open(&self.pk2_path)?);
-        reader.seek(SeekFrom::Start(offset.into()));
-        reader.read_exact(&mut buffer);
+        reader.seek(SeekFrom::Start(offset.into()))?;
+        reader.read_exact(&mut buffer)?;
         Ok(buffer)
     }
 
-    fn append_bytes(&self, buffer: &[u8]) -> io::Result<(u64)> {
+    fn append_bytes(&self, buffer: &[u8]) -> io::Result<u64> {
         let mut writer = BufWriter::new(OpenOptions::new().append(true).open(&self.pk2_path)?);
         let index = writer.seek(SeekFrom::End(0)).unwrap();
-        writer.write_all(buffer).expect("Couldn't append bytes.");
+        writer.write_all(buffer)?;
         Ok(index)
     }
 
-    fn write_bytes(&self, offset: u32, buffer: &[u8]) -> io::Result<()> {
+    fn write_bytes(&self, offset: u64, buffer: &[u8]) -> io::Result<()> {
         let mut writer = BufWriter::new(OpenOptions::new().write(true).open(&self.pk2_path)?);
-        writer.seek(SeekFrom::Start(offset.into()));
-        writer.write_all(buffer).expect("Couldn't write to file.");
+        writer.seek(SeekFrom::Start(offset.into()))?;
+        writer.write_all(buffer)?;
         Ok(())
     }
 
@@ -324,7 +293,7 @@ mod tests {
     fn test_extract() {
         let path = "/home/sorcerer/Desktop/Media.pk2";
         let extractor = Extractor::new(Some(path));
-        let output = extractor.unwrap().extract(
+        let _output = extractor.unwrap().extract(
             Some("server_dep/silkroad/textdata/siegefortressreward.txt"));
     }
 
@@ -332,16 +301,15 @@ mod tests {
     fn test_list() {
         let path = "/home/sorcerer/Desktop/Media.pk2";
         let extractor = Extractor::new(Some(path));
-        let output = extractor.unwrap().extract(
-            Some("server_dep/silkroad/textdata/siegefortressreward.txt"));
+        let _output = extractor.unwrap().list(
+            Some("server_dep/silkroad/"));
     }
 
     #[test]
-    #[ignore]
     fn test_patch() {
         let path = "/home/sorcerer/Desktop/Media.pk2";
         let extractor = Extractor::new(Some(path));
-        let index = extractor.unwrap().patch(
+        let _index = extractor.unwrap().patch(
             "server_dep/silkroad/textdata/siegefortressreward.txt", 
             &[1,2,3,4,5,6,8,9]
         );

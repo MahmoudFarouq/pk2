@@ -1,11 +1,9 @@
-#![allow(dead_code)]
-
 use std::num::Wrapping;
 
-const BLOCK_SIZE    : u32 = 8;
-const MAX_KEY_LENGTH: u32 = 0x38;
-const PBOX_ENTRIES  : u32 = 0x12;
-const SBOX_ENTRIES  : u32 = 0x100;
+// const BLOCK_SIZE    : u32 = 8;
+// const MAX_KEY_LENGTH: u32 = 0x38;
+// const PBOX_ENTRIES  : u32 = 0x12;
+// const SBOX_ENTRIES  : u32 = 0x100;
 
 const PBOX_INIT: [u32; 18] = [ 
     0x243f6a88, 0x85a308d3, 0x13198a2e, 0x3707344, 0xa4093822, 0x299f31d0, 
@@ -215,7 +213,7 @@ impl BlowFish {
         self.block[7] = num1.3;
     }
 
-    pub fn encrypt(&self, input: &[u8], count: i32) -> [u8; 128] {
+    pub fn encrypt(&self, input: &[u8], count: u32) -> [u8; 128] {
         let mut output: [u8; 128] = [0; 128];
 
         for i in (0..count).step_by(8) {
@@ -246,7 +244,7 @@ impl BlowFish {
         output
     }
 
-    pub fn decrypt(&self, input: &[u8], count: i32) -> [u8; 128] {
+    pub fn decrypt(&self, input: &[u8], count: u32) -> [u8; 128] {
         let mut output: [u8; 128] = [0; 128];
 
         for i in (0..count).step_by(8) {
